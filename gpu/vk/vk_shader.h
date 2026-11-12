@@ -23,6 +23,10 @@ struct Stage {
     VkShaderModule module = VK_NULL_HANDLE;
     Shader::Info info;
     std::vector<uint8_t> c1;   // its c1 constants (the code area's tail)
+    // (hookshot) its SPIR-V's OpPhi instructions (fallback_size_policy.h), noted where the SPIR-V is written to or read from the
+    // program cache (vk_progcache.cpp), which every translated program passes. Not in vk_shader.cpp, whose bytes are part of
+    // the translator's stamp: a change there translates every player's programs again
+    mutable uint32_t phis = 0;
 };
 
 /// A texture handle the stage reads from a storage buffer: its handle program (Shader::Info::handle_programs, Eden's
@@ -45,11 +49,13 @@ struct Program {
     VkPipeline compute_pipeline = VK_NULL_HANDLE;
     // (the compute pipeline's build: 0 not started, 1 on a worker, 2 done (compute_pipeline made, or failed): vk_draw.cpp dispatch)
     std::atomic<int> compute_state{0};
+    mutable std::atomic<bool> dispatched{false};   // (hookshot) noted in hookshot_computes.bin (vk_draw.cpp compute_note)
     bool push = false;             // its set is pushed (VK_KHR_push_descriptor)
     VkShaderStageFlags push_stages = 0;
     bool uses_render_area = false;
     bool uses_push = true;   // (a stage reads the push constants: render area or rescaling)
     bool mesh = false;              // task / mesh stages (VK_EXT_mesh_shader)
+    bool scene_tonemap = false;     // (hookshot) its scene tone map is PsychoV35 (vk_shader.cpp scene_tonemap_for; in its key)
     // (hookshot) the GPU has no mesh shaders: the task and mesh stages are compute pipelines, and a generated vertex
     // stage reads the records they write. Its stages are (task,) mesh, vertex, fragment.
     bool fallback = false;
@@ -89,9 +95,10 @@ const Program* program_pick(const NvnState& s, ProgramKind kind, const uint8_t c
 void program_wait(const Program* p);
 uint64_t program_cache_stamp();   // (what the kept programs and pipelines are good for)
 size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const std::function<void(Program&)>& fn,
-                               bool computes = true);   // (computes: and every kept compute program)
+                               bool computes = true, bool fallbacks = false);   // (computes: and every kept compute program)
 /// The precompile of every shader of the game (hookshot_shaders.bin, from nx2/shader_census.py): how many programs it names, 0: none
 size_t seed_open();
+std::string seed_path();   // (hookshot_shaders.bin, beside the game)
 void seed_close();
 /// Program i of the seed, translated and kept for the default state (null: kept already, or it does not translate); its modules are yours
 std::unique_ptr<Program> seed_program(size_t i, int inputs = 0);
@@ -106,19 +113,29 @@ SeedVariants seed_compute(size_t i, size_t cap, const std::function<void(Program
 /// (hookshot, the prediction: vk_predict.cpp) a kept graphics program variant as hookshot_programs.bin has it: each stage's SPIR-V
 struct KeptProgram {
     uint64_t key = 0, variant = 0;
+    int64_t at = 0;   // (where its record is in the file: of two records of one variant, the later is the one kept)
     bool mesh = false;
     std::vector<std::pair<VkShaderStageFlagBits, std::vector<uint32_t>>> stages;
 };
-void program_cache_each(const std::function<void(const KeptProgram&)>& fn);
+void program_cache_each(const std::function<void(const KeptProgram&)>& fn);   // (fn: on several threads at once, in no order)
 void program_cache_borrow(uint64_t key, const std::function<void(Program&)>& fn);   // (made for fn, then let go; still kept)
+/// (hookshot) Every kept graphics and mesh program's key, in the file's order, no record read; *loaded: the variants in memory already
+std::vector<uint64_t> program_cache_keys(std::vector<Program*>* loaded);
 const Program* program_find(uint64_t key, uint64_t variant);
+/// (hookshot) The pipeline state list's variants, the same on every GPU: the answers with their stages numbered without the mesh
+/// fallback's generated vertex stage, and their hash (a graphics or native mesh program's: its own); a loaded variant by that hash
+std::vector<Program::Answer> answers_portable(const Program& p);
+std::vector<Program::Answer> answers_here(const Program& p, std::vector<Program::Answer> portable);   // (the inverse)
+uint64_t answers_hash_of(const std::vector<Program::Answer>& answers);   // (a variant's: Program::variant)
+uint64_t portable_variant(const Program& p);
+const Program* program_find_portable(uint64_t key, uint64_t variant);
 /// (hookshot) The pipeline state list (vk_draw.cpp): a program by its stages' code keys (graphics: vertex, fragment; mesh: mesh,
 /// fragment, task) and the vertex inputs and colour output types it was drawn with, from the seed (seed_open first): translated
 /// and kept unless kept already (null then, or when it does not translate). *key_out: its key, 0 when a stage is not in the seed
 std::unique_ptr<Program> seed_program_of(const uint64_t code[3], bool mesh, const uint32_t attributes[16], const uint8_t color_types[8],
                                          uint64_t* key_out);
 /// (hookshot) The same for a program variant made by other textures' answers: translated with the answers given in the order asked
-/// (Program::questions) and taking those answers (Program::answers); kept in memory for the precompile, and in the program cache.
+/// (Program::questions) and taking those answers (Program::answers, numbered as answers_portable has them); kept in memory for the precompile, and in the program cache.
 /// Null when a stage is not in the seed or it does not translate
 const Program* seed_variant_of(const uint64_t code[3], bool mesh, const uint32_t attributes[16], const uint8_t color_types[8],
                                const std::vector<uint8_t>& questions, const std::vector<Program::Answer>& answers);

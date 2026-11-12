@@ -25,6 +25,9 @@
 #include <string.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#ifndef HOOKSHOT_ENV_H   /* (env_on: the switches' one rule) */
+#include "../gpu/vk/compat/hookshot_env.h"
+#endif
 
 #define MIC_MAGIC 0x4D494349u   /* "MICI": the high word of our handle in the game's InputStreamType */
 #define MAX_STREAMS 4
@@ -326,7 +329,7 @@ static void detach(InStream *s) {
 }
 static void note_read(InStream *s, const uint8_t *p, int frames) {
     s->frames_read += frames;
-    if (log_on < 0) log_on = getenv("HOS_MIC_LOG") != NULL;
+    if (log_on < 0) log_on = env_on("HOS_MIC_LOG");
     if (!log_on) return;
     if (s->format == FMT_PCM16)
         for (int i = 0; i < frames * s->channels; i++) {
@@ -382,7 +385,8 @@ HLE(_ZN2nn5audio15OpenInputStreamEPNS0_15InputStreamTypeEPvmRKNS0_15AudioDeviceN
     if (s->channels < 1 || s->channels > 8) s->channels = 1;
     if (s->rate < 8000 || s->rate > 192000) s->rate = 48000;
     s->frame_bytes = sample_bytes(s->format) * s->channels;
-    s->capacity = frames > 0 ? frames : s->rate / 10;
+    /* (hookshot) at most 10 s: the ring's byte offsets are ints (a larger frame count from the game overflowed them) */
+    s->capacity = frames > 0 && frames <= s->rate * 10 ? frames : frames > 0 ? s->rate * 10 : s->rate / 10;
     s->ring = (uint8_t *)malloc((size_t)s->capacity * s->frame_bytes);
     if (!s->ring) {
         ReleaseSRWLockExclusive(&lock);
@@ -476,14 +480,17 @@ HLE(_ZN2nn5audio15ReadInputStreamEPNS0_15InputStreamTypeEPvi) {
     if (s && ARG(1) && (int)ARG(2) > 0) {
         const int have = filled(s);
         frames = (int)ARG(2) < have ? (int)ARG(2) : have;
-        uint8_t *dst = (uint8_t *)GP(ARG(1));
         const int cap = s->capacity * s->frame_bytes, n = frames * s->frame_bytes;
-        const int first = n < cap - s->ring_start ? n : cap - s->ring_start;
-        memcpy(dst, s->ring + s->ring_start, (size_t)first);
-        memcpy(dst + first, s->ring, (size_t)(n - first));
-        s->ring_start = (s->ring_start + n) % cap, s->ring_len -= n;
-        HOS_WRITTEN(dst, (size_t)n);
-        note_read(s, dst, frames);
+        uint8_t *dst = (uint8_t *)hos_guest_range(ARG(1), (uint64_t)n);   /* (hookshot: only into guest memory) */
+        if (!dst) frames = 0;
+        else {
+            const int first = n < cap - s->ring_start ? n : cap - s->ring_start;
+            memcpy(dst, s->ring + s->ring_start, (size_t)first);
+            memcpy(dst + first, s->ring, (size_t)(n - first));
+            s->ring_start = (s->ring_start + n) % cap, s->ring_len -= n;
+            HOS_WRITTEN(dst, (size_t)n);
+            note_read(s, dst, frames);
+        }
     }
     ReleaseSRWLockExclusive(&lock);
     RET(frames);

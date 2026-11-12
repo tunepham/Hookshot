@@ -21,6 +21,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+# (env_on, the switches' rule, before the code cut out of the sources: gpu/vk/compat/hookshot_env.h)
+ENV_ON_H = str(Path(__file__).resolve().parents[1] / "gpu" / "vk" / "compat" / "hookshot_env.h")
+
 ROOT = Path(__file__).resolve().parents[1]
 
 HOS_H = r"""
@@ -66,6 +69,7 @@ static void puti(uint64_t a, int32_t v) { memcpy(GP(a), &v, 4); }
 static int fails;
 #define PITCH (CAM + 0x18c)
 #define YAW (CAM + 0x1a4)
+static void state(uint32_t v) { memcpy(GP(CAM + 0x204), &v, 4); }
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s (pitch %g yaw %g)\n", __LINE__, #c, getf(PITCH), getf(YAW)); fails++; } } while (0)
 static int near(float a, float b) { return fabsf(a - b) < 1e-3f; }
 static void frame(int32_t dx, int32_t dy) { move_x += dx, move_y += dy; clock_ns += 16666667; hos_mouse_camera(CAM); }
@@ -77,6 +81,7 @@ int main(void) {
     putf(CAM + 0x178, -85), putf(CAM + 0x17c, 89);
     puti(CAM + 0x204, 3);
     putf(PITCH, 10), putf(YAW, 30);
+    state(4);   /* turned by the player */
     move_x = 5, move_y = 3;
     CHECK(hos_mouse_native() == -1);   /* no camera has run yet: the stick takes it */
     move_x = move_y = 0;
@@ -155,6 +160,19 @@ int main(void) {
     captured = 1;
     clock_ns += 200000000LL;   /* no camera for 200 ms (the pause menu): the stick again */
     CHECK(hos_mouse_native() == -1);
+    /* aiming in first person (the slingshot): the camera keeps updating, state 0, another draws: the stick takes it */
+    state(4);
+    frame(0, 0);   /* the camera's a moment ago (the hook ran: hos_mouse_native would give 1 for 150 ms) */
+    state(0);
+    putf(YAW, 0);
+    frame(10, 0);
+    CHECK(near(getf(YAW), 0.0f) && move_x == 10);
+    CHECK(hos_mouse_native() == -1);   /* at once, not 150 ms later */
+    move_x = 0;
+    state(3);   /* following Link again: the mouse turns it */
+    frame(10, 0);
+    CHECK(near(getf(YAW), -1.0f));
+    CHECK(hos_mouse_native() == 1);
     if (!fails) printf("PASS\n");
     return fails != 0;
 }
@@ -175,7 +193,7 @@ class MouseNativeTests(unittest.TestCase):
             shutil.copy(ROOT / "host" / "mouse_native.c", tmp / "mouse_native.c")
             (tmp / "t.c").write_text(FIXTURE, encoding="utf-8")
             binary = tmp / "t"
-            build = subprocess.run([compiler, "-std=gnu11", "-Wall", "-O1", "-g", "-I", str(tmp), "-I", str(ROOT / "host" / "posix"),
+            build = subprocess.run([compiler, "-std=gnu11", "-include", ENV_ON_H, "-Wall", "-O1", "-g", "-I", str(tmp), "-I", str(ROOT / "host" / "posix"),
                                     str(tmp / "t.c"), str(tmp / "mouse_native.c"), "-o", str(binary), "-lm"],
                                    text=True, capture_output=True)
             self.assertEqual(build.returncode, 0, build.stderr)

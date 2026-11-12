@@ -34,6 +34,9 @@
 #include <string.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#ifndef HOOKSHOT_ENV_H   /* (env_on: the switches' one rule) */
+#include "../gpu/vk/compat/hookshot_env.h"
+#endif
 
 int hos_mouse_take(int32_t *dx, int32_t *dy);                                   /* display.c */
 void hos_mouse_give_back(int32_t dx, int32_t dy);                               /* display.c */
@@ -71,7 +74,7 @@ static int native_on(void) {
 
 static int invert_y(void) {
     static int env = -1;
-    if (env < 0) env = getenv("HOS_MOUSE_INVERT_Y") != NULL;
+    if (env < 0) env = env_on("HOS_MOUSE_INVERT_Y");
     return env || rx_option(8, 0);   /* (the menu's Invert mouse vertical) */
 }
 
@@ -103,6 +106,27 @@ void hos_mouse_native_stick(int held) { InterlockedExchange(&stick_held, held ? 
 /* f_80644c80's first line (nx2/oot_patches.py): cam is the player camera, the game's thread */
 void hos_mouse_camera(uint64_t cam) {
     if (!cam || !native_on() || !looks_like_camera(cam)) return;
+    /* Only while it is the view: following Link (3) or turned by the player (4). Aiming the slingshot in first person
+       leaves this camera updating with its state 0 while another one draws (traced at Hyrule Castle); shops are reported
+       the same. In any other state the mouse is the right stick, which those views turn by (the hook counts as not
+       run, so hos_mouse_native gives -1) */
+    uint32_t state;
+    memcpy(&state, GP(cam + STATE_AT), 4);
+    if (state != 3 && state != 4) {
+        /* (at once: the stick takes the next motion, not one burst once the 150 ms run out) */
+        InterlockedExchange64(&last_hook_ns, 0);
+        /* (each state seen leaving the mouse to the stick, once: what another view, Z-targeting, climbing or swimming,
+           is, to add here if one of them should turn with the mouse) */
+        static uint32_t said[8];
+        static int nsaid;
+        int seen = 0;
+        for (int i = 0; i < nsaid; i++) seen |= said[i] == state;
+        if (!seen && nsaid < 8) {
+            said[nsaid++] = state;
+            hos_log("mouse native: camera state %u: the mouse is the right stick", state);
+        }
+        return;
+    }
     InterlockedExchange64(&last_hook_ns, hos_now_ns());
     InterlockedExchange(&last_state, geti(cam + STATE_AT));
     if (!free_look()) {   /* (a menu, an item wheel, a lock-on, the bow: the game's camera, and the motion is the right stick's, nn_hid.c) */

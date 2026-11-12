@@ -21,7 +21,7 @@ SOURCE = ROOT / "nx2/make_game.py"
 
 def production():
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
-    helpers = {"say", "fail", "gen_print", "write_lift_key", "lifted_before"}
+    helpers = {"say", "fail", "gen_print", "write_lift_key", "lifted_before", "kept_before", "kept_list_fits"}
     definitions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in helpers]
     assert {node.name for node in definitions} == helpers
     key = next(node for node in tree.body if isinstance(node, ast.Assign) and
@@ -30,7 +30,8 @@ def production():
     branches = [node for node in ast.walk(main) if isinstance(node, ast.If) and isinstance(node.test, ast.Call) and
                 isinstance(node.test.func, ast.Name) and node.test.func.id == "lifted_before"]
     assert len(branches) == 1
-    namespace = dict(os=os, sys=sys, hashlib=hashlib)
+    # (PREPARE: the module global say() reads since --prepare for RecompLauncher; off, as make_game starts)
+    namespace = dict(os=os, sys=sys, hashlib=hashlib, PREPARE=False)
     exec(compile(ast.Module(body=[key, *definitions], type_ignores=[]), str(SOURCE), "exec"), namespace)
     return namespace, compile(ast.Module(body=branches, type_ignores=[]), str(SOURCE), "exec")
 
@@ -47,7 +48,9 @@ class LiftCleanupErrorTests(unittest.TestCase):
         self.key = self.gen / ".lift_key"
         self.events = []
         self.namespace, self.branch = production()
-        self.namespace.update(work=str(self.work), exefs=str(self.root / "exefs"), env={}, key="b" * 40, PY=["authored-python"])
+        self.namespace.update(work=str(self.work), exefs=str(self.root / "exefs"), env={}, key="b" * 40, PY=["authored-python"],
+                              gen_dir=str(self.gen), KEPT_LIST="lifted_objects.txt", KEPT_SCHEME=1,
+                              kept_lift=[], contextlib=contextlib)
         self.actual_write = self.namespace["write_lift_key"]
 
         def write_key(work, key):

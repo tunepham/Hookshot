@@ -17,6 +17,8 @@ import re
 import subprocess
 import tempfile
 
+RUN_ALL_ARGS = ["--cxx", "{cxx}"]
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -53,6 +55,7 @@ void checkpoints_report() {
     std::fflush(stdout);
     std::_Exit(3);
 }
+[[noreturn]] void device_lost(const char* why = nullptr);
 @@DEVICE_LOST@@
 int main() {
     std::vector<std::thread> t;
@@ -78,11 +81,12 @@ def main():
     if "host->log_flush()" not in fatal or fatal.index("host->log_flush()") > fatal.index("std::_Exit("):
         raise SystemExit("FAIL: replay_fatal ends the process without writing out the host's queued log")
     backend = (ROOT / "host" / "rx_backend.c").read_text(encoding="utf-8")
-    if not re.search(r"hos_sdl_gyro_status,\s*hos_log_flush,\s*\};", backend):
+    # (in MkwVkHost's order, right after gyro_status; later fields may follow it)
+    if not re.search(r"hos_sdl_gyro_status,\s*hos_log_flush,", backend):
         raise SystemExit("FAIL: host/rx_backend.c does not give the back end hos_log_flush (MkwVkHost.log_flush)")
     with tempfile.TemporaryDirectory(prefix="device-lost-") as tmp:
         src, exe = Path(tmp) / "fixture.cpp", Path(tmp) / "fixture.exe"
-        src.write_text(FIXTURE.replace("@@DEVICE_LOST@@", block(replay, "[[noreturn]] void device_lost() {")), encoding="utf-8")
+        src.write_text(FIXTURE.replace("@@DEVICE_LOST@@", block(replay, "[[noreturn]] void device_lost(const char* why) {")), encoding="utf-8")
         command = [args.cxx, "-std=c++17", "-O1", str(src), "-o", str(exe)] + ([] if os.name == "nt" else ["-pthread"])
         r = subprocess.run(command, capture_output=True, text=True, timeout=120)
         if r.returncode:

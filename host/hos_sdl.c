@@ -22,6 +22,7 @@ static struct {
     void *PadOpen, *PadClose, *PadConnected, *PadsUpdate, *PadButton, *PadAxis, *PadName, *PadRumble;
     void *PadType, *PadEffect;   /* (optional: HD rumble, host/pad_sdl.c) */
     void *PadHasSensor, *PadSensorEnable, *PadSensorData;   /* (motion: optional, NULL in an SDL without them) */
+    void *PadVendor, *PadSteamHandle, *SetHintPriority;   /* (Steam's stand-in pads: optional, host/steam_pads.h) */
     void *GetGamepads, *GetGamepadID, *Free;   /* (SDL3) */
     void *NumJoysticks, *IsGameController, *DeviceInstanceID, *GetJoystick, *JoystickInstanceID;   /* (SDL2) */
 } f;
@@ -32,8 +33,12 @@ static HMODULE load_one(const char *dll) {   /* beside the executable, else the 
     DWORD n = GetModuleFileNameA(NULL, path, sizeof path);
     while (n && path[n - 1] != '\\' && path[n - 1] != '/') n--;
     snprintf(path + n, sizeof path - n, "%s", dll);
-    HMODULE m = LoadLibraryA(path);
+    HMODULE m = n ? LoadLibraryA(path) : NULL;   /* (no folder: a bare name would search the current folder and PATH) */
+#ifdef _WIN32   /* (hookshot: else the system's, not the current folder's or PATH's) */
+    return m ? m : LoadLibraryExA(dll, NULL, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+#else
     return m ? m : LoadLibraryA(dll);
+#endif
 }
 static int get_all(HMODULE m, int three) {
 #define GET(field, name) if (!(*(FARPROC *)&f.field = GetProcAddress(m, name))) { hos_log("sdl: SDL%d has no %s", three ? 3 : 2, name); return 0; }
@@ -67,6 +72,11 @@ static int get_all(HMODULE m, int three) {
     *(FARPROC *)&f.PadHasSensor = GetProcAddress(m, three ? "SDL_GamepadHasSensor" : "SDL_GameControllerHasSensor");
     *(FARPROC *)&f.PadSensorEnable = GetProcAddress(m, three ? "SDL_SetGamepadSensorEnabled" : "SDL_GameControllerSetSensorEnabled");
     *(FARPROC *)&f.PadSensorData = GetProcAddress(m, three ? "SDL_GetGamepadSensorData" : "SDL_GameControllerGetSensorData");
+    /* (Steam's stand-in pads told apart from the real ones: SDL 2.30 on and SDL3 3.2 on; without them Steam's
+       controller ignore list stays as Steam set it) */
+    *(FARPROC *)&f.PadVendor = GetProcAddress(m, three ? "SDL_GetGamepadVendor" : "SDL_GameControllerGetVendor");
+    *(FARPROC *)&f.PadSteamHandle = GetProcAddress(m, three ? "SDL_GetGamepadSteamHandle" : "SDL_GameControllerGetSteamHandle");
+    *(FARPROC *)&f.SetHintPriority = GetProcAddress(m, "SDL_SetHintWithPriority");
     if (three) {
         GET(SetWindowPosition, "SDL_SetWindowPosition");
         GET(GetPrimaryDisplay, "SDL_GetPrimaryDisplay");
@@ -119,6 +129,13 @@ void hos_sdl_hint(const char *name, const char *value) {
     if (!hos_sdl_load()) return;
     if (version == 3) CALL(_Bool (*)(const char *, const char *), SetHint)(name, value);
     else CALL(int (*)(const char *, const char *), SetHint)(name, value);
+}
+/* (hookshot) a hint over the environment's own (SDL_HINT_OVERRIDE, 2 in both): a variable Steam sets for the games it
+   starts wins over SDL_SetHint. 0 when the SDL has no SDL_SetHintWithPriority */
+int hos_sdl_hint_override(const char *name, const char *value) {
+    if (!hos_sdl_load() || !f.SetHintPriority) return 0;
+    if (version == 3) return CALL(_Bool (*)(const char *, const char *, int), SetHintPriority)(name, value, 2);
+    return CALL(int (*)(const char *, const char *, int), SetHintPriority)(name, value, 2) != 0;
 }
 void hos_sdl_identity(const char *name, const char *app_id) {
     if (!hos_sdl_load()) return;
@@ -210,6 +227,14 @@ void hos_sdl_icon(void *window, const char *png) {
 uint32_t hos_sdl_mouse_buttons(void) {
     return version == 3 ? CALL(uint32_t (*)(float *, float *), GetMouseState)(NULL, NULL)
                         : CALL(uint32_t (*)(int *, int *), GetMouseState)(NULL, NULL);
+}
+void hos_sdl_mouse_position(float *x, float *y) {
+    if (version == 3) CALL(uint32_t (*)(float *, float *), GetMouseState)(x, y);
+    else {
+        int ix = 0, iy = 0;
+        CALL(uint32_t (*)(int *, int *), GetMouseState)(&ix, &iy);
+        *x = (float)ix, *y = (float)iy;
+    }
 }
 void hos_sdl_window_size(void *window, int *width, int *height) {
     if (version == 3) CALL(_Bool (*)(void *, int *, int *), GetWindowSize)(window, width, height);
@@ -329,7 +354,8 @@ static void pull2(void *p, uint8_t *out, int len) {   /* (SDL2: a device callbac
 int hos_sdl_audio_open(int freq, int channels, int s16, void (*pull)(void *user, uint8_t *out, int len), void *user) {
     if (!hos_sdl_load()) return 0;
     const uint16_t format = s16 ? 0x8010 /* S16LE */ : 0x8120 /* F32LE */;   /* (both's numbers) */
-    if (version == 3) hos_sdl_hint("SDL_AUDIO_DEVICE_SAMPLE_FRAMES", "512");   /* (SDL2's device buffer below) */
+    const char *env_samples = getenv("SDL_AUDIO_DEVICE_SAMPLE_FRAMES");
+    if (version == 3 && !env_samples) hos_sdl_hint("SDL_AUDIO_DEVICE_SAMPLE_FRAMES", "480");   /* (SDL2's device buffer below) */
     if (!hos_sdl_init(HOS_SDL_AUDIO)) return 0;
     Pull *p = (Pull *)calloc(1, sizeof *p);
     p->pull = pull, p->user = user, p->frame = channels * (s16 ? 2 : 4);
@@ -351,7 +377,8 @@ int hos_sdl_audio_open(int freq, int channels, int s16, void (*pull)(void *user,
         void *userdata;
     } want, have;
     memset(&want, 0, sizeof want);
-    want.freq = freq, want.format = format, want.channels = (uint8_t)channels, want.samples = 512;
+    want.freq = freq, want.format = format, want.channels = (uint8_t)channels;
+    want.samples = (uint16_t)(env_samples && atoi(env_samples) > 0 ? atoi(env_samples) : 512);   /* (SDL2 asks for a power of two) */
     want.callback = pull2, want.userdata = p;
     /* (no changes allowed: SDL converts to what the device wants) */
     const uint32_t dev = CALL(uint32_t (*)(const char *, int, const void *, void *, int), OpenAudioDevice)(NULL, 0, &want, &have, 0);
@@ -615,5 +642,12 @@ int hos_sdl_pad_sensor(void *pad, int type, float *data, int n) {
     if (!f.PadSensorData) return 0;
     return version == 3 ? CALL(_Bool (*)(void *, int, float *, int), PadSensorData)(pad, type, data, n)
                         : CALL(int (*)(void *, int, float *, int), PadSensorData)(pad, type, data, n) == 0;
+}
+/* (Steam's stand-in pads, host/steam_pads.h) whether the SDL tells them apart; a pad's USB vendor (0 unknown); its
+   Steam Input handle, not 0 for a Steam stand-in pad */
+int hos_sdl_knows_steam_pads(void) { return f.PadVendor && f.PadSteamHandle && f.SetHintPriority; }
+uint16_t hos_sdl_pad_vendor(void *pad) { return f.PadVendor ? CALL(uint16_t (*)(void *), PadVendor)(pad) : 0; }
+uint64_t hos_sdl_pad_steam_handle(void *pad) {
+    return f.PadSteamHandle ? CALL(uint64_t (*)(void *), PadSteamHandle)(pad) : 0;
 }
 #undef CALL

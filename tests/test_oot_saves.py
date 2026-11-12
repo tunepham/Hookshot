@@ -12,6 +12,12 @@ import tempfile
 import unittest
 from unittest import mock
 
+# (Linux only)
+RUN_ALL_SKIP = {
+    "windows": "the save script's folder discovery is the Linux one"
+               " (on Windows Hookshot's saves are in the game folder: --hookshot)",
+}
+
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("oot_saves", ROOT / "scripts" / "oot_saves.py")
 oot = importlib.util.module_from_spec(spec)
@@ -103,6 +109,40 @@ class Discovery(Case):
             make_save(game / "user" / "save" / UID, b"W")
             self.assertEqual(oot.locate(oot.HOOKSHOT, str(game), "--hookshot")[1], {UID: str(game / "user" / "save" / UID)})
 
+    def test_lichii_s_own_folder_first(self):
+        # (Lichii from its build 150 on keeps %APPDATA%\\lichii, ~/.local/share/lichii; the others stay in Eden's)
+        own = eden_save(self.data / "lichii")
+        make_save(own, b"L2", slots=("slot_02",))
+        by_name = {p.name: p for p in oot.EMULATORS}
+        self.assertEqual(oot.locate(by_name["lichii"], None, "--from"), (str(self.data / "lichii"), {PROFILE: str(own)}))
+        for name in ("frizti", "orchid", "pokedinner", "eden"):
+            self.assertEqual(list(oot.locate(by_name[name], None, "--from")[1].values()), [str(self.li)], name)
+        win_own, win_eden = eden_save(self.appdata / "lichii"), eden_save(self.appdata / "eden")
+        make_save(win_own, b"W2")
+        make_save(win_eden, b"W1")
+        with mock.patch.object(oot, "WINDOWS", True):
+            self.assertEqual(list(oot.locate(by_name["lichii"], None, "--from")[1].values()), [str(win_own)])
+            self.assertEqual(list(oot.locate(by_name["orchid"], None, "--from")[1].values()), [str(win_eden)])
+
+    def test_lichii_s_own_folder_without_a_save_leaves_the_older_one(self):
+        (self.data / "lichii" / "nand" / "user" / "save").mkdir(parents=True)   # (started, the game never saved there)
+        by_name = {p.name: p for p in oot.EMULATORS}
+        self.assertEqual(list(oot.locate(by_name["lichii"], None, "--from")[1].values()), [str(self.li)])
+
+    def test_lichii_s_copy_goes_to_its_own_folder(self):
+        own = eden_save(self.data / "lichii")
+        make_save(own, b"L2", slots=("slot_02",))
+        before = tree(self.li)
+        code, out, err = self.run_main("export", "lichii")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(tree(own), tree(self.hs))
+        self.assertEqual(tree(self.li), before, "Eden's folder was written for Lichii")
+        (own / "account.sav").write_bytes(b"played on in Lichii")
+        code, out, err = self.run_main("import", "lichii")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(tree(self.hs), tree(own))
+        self.assertEqual(tree(self.li), before)
+
     def test_aliases_of_names(self):
         self.assertIs(oot.program_named("Fritchii"), oot.program_named("frizti"))
         with self.assertRaises(oot.Fail):
@@ -167,6 +207,24 @@ class Discovery(Case):
         for text in (UID, PROFILE, ACCOUNT, "slot_01", "Lichii / Frizti (Fritchii) / Orchid / PokeDinner / Eden", "NX2navi",
                      "Eglantine: nothing in"):
             self.assertIn(text, out)
+
+    def test_list_with_lichii_s_own_folder(self):
+        make_save(eden_save(self.data / "lichii"), b"L2", slots=("slot_02",))
+        code, out, err = self.run_main("list")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Lichii: %s\n" % (self.data / "lichii"), out)
+        self.assertIn("Frizti (Fritchii) / Orchid / PokeDinner / Eden (one shared folder): %s\n" % (self.data / "eden"), out)
+        self.assertIn("slot_02", out)
+        self.assertEqual(out.count(str(self.data / "eden") + "\n"), 1)
+
+    def test_list_with_no_emulator_save(self):
+        for f in sorted(self.li.rglob("*"), reverse=True):
+            f.unlink() if f.is_file() else f.rmdir()
+        self.li.rmdir()
+        code, out, err = self.run_main("list")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Lichii: nothing in %s, %s\n" % (self.data / "lichii", self.data / "eden"), out)
+        self.assertIn("Frizti (Fritchii) / Orchid / PokeDinner / Eden (one shared folder): nothing in %s\n" % (self.data / "eden"), out)
 
     def test_list_without_hookshot(self):
         (self.hs / "account.sav").unlink()
@@ -242,10 +300,61 @@ class Copy(Case):
         self.assertEqual(code, 1)
         self.assertIn("--from", err)
 
+    def test_links_in_a_save_refused(self):
+        secret = self.tmp / "secret.txt"
+        secret.write_bytes(b"not a save")
+        before = tree(self.hs)
+        for make in (lambda o: (o / "slot_00" / "progress.sav").unlink() or (o / "slot_00" / "progress.sav").symlink_to(secret),
+                     lambda o: (o / "account.sav").unlink() or (o / "account.sav").symlink_to(secret),
+                     lambda o: (o / "slot_00" / "deep").symlink_to(self.tmp, target_is_directory=True)):
+            other = self.tmp / ("linked-%d" % len(list(self.tmp.glob("linked-*"))))
+            make_save(other, b"L", slots=("slot_00",))
+            make(other)
+            code, out, err = self.run_main("import", "--from", str(other))
+            self.assertEqual(code, 1, out)
+            self.assertIn("is a link", err)
+            self.assertEqual(tree(self.hs), before)
+        self.assertEqual(secret.read_bytes(), b"not a save")
+
+    def test_junction_refused(self):
+        # (a Windows junction is a reparse point, not a symbolic link; os.path.isjunction is only in Python 3.12 and newer)
+        other = self.tmp / "junction"
+        make_save(other, b"J", slots=("slot_00",))
+        deep = other / "slot_00" / "deep"
+        deep.mkdir()
+        real_lstat = os.lstat
+
+        class Junction:
+            def __init__(self, st):
+                self.st_mode, self.st_file_attributes = st.st_mode, 0x400 | 0x10
+
+        def lstat(path, *a, **k):
+            st = real_lstat(path, *a, **k)
+            return Junction(st) if os.path.abspath(path) == str(deep) else st
+        before = tree(self.hs)
+        with mock.patch.object(oot.os, "lstat", lstat):
+            code, out, err = self.run_main("import", "--from", str(other))
+        self.assertEqual(code, 1, out)
+        self.assertIn("is a link", err)
+        self.assertEqual(tree(self.hs), before)
+
     def test_same_folder_refused(self):
         code, out, err = self.run_main("import", "--from", str(self.hs))
         self.assertEqual(code, 1)
         self.assertIn("both the source and the target", err)
+
+    def test_backup_inside_target_refused_before_copy(self):
+        self.backups = self.hs / "backups"
+        before = tree(self.hs)
+        for extra in ((), ("--dry-run",)):
+            with self.subTest(extra=extra), mock.patch.object(
+                oot.shutil, "copytree", side_effect=AssertionError("recursive backup copy started")
+            ):
+                code, _, err = self.run_main("import", "--from", str(self.li), "--hookshot", str(self.hs), *extra)
+                self.assertEqual(code, 1)
+                self.assertIn("--backup-dir outside the target save folder", err)
+                self.assertFalse(self.backups.exists())
+                self.assertEqual(tree(self.hs), before)
 
     def test_keep_settings(self):
         code, out, err = self.run_main("export", "lichii", "--keep-settings")

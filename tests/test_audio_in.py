@@ -12,6 +12,11 @@ from pathlib import Path
 import subprocess
 import tempfile
 
+# (env_on, the switches' rule, before the code cut out of the sources: gpu/vk/compat/hookshot_env.h)
+ENV_ON_H = str(Path(__file__).resolve().parents[1] / "gpu" / "vk" / "compat" / "hookshot_env.h")
+
+RUN_ALL_ARGS = ["--cc", "gcc", "--cxx", "g++"]
+
 ROOT = Path(__file__).resolve().parents[1]
 
 HOS_H = r'''
@@ -27,6 +32,7 @@ typedef struct { uint64_t x[32]; uint64_t vreg[32][2]; } Ctx;
 #define G64(a) (*(uint64_t *)GP(a))
 #define G32(a) (*(uint32_t *)GP(a))
 #define HOS_WRITTEN(p, n) ((void)0)
+static inline void *hos_guest_range(uint64_t a, uint64_t n) { (void)n; return a ? GP(a) : (void *)0; }   /* (the test's addresses are host ones) */
 void hos_log(const char *fmt, ...);
 int64_t hos_now_ns(void);
 '''
@@ -269,6 +275,21 @@ int main(void) {
     if (stream[0] || READ(stream, buf, 16) != 0) FAIL(39, "closed: the handle gone");
     if (OPEN(stream, names[0]) != 0) FAIL(40, "a closed stream's slot is used again");
     cases += 4;
+
+    /* a frame count from the game past 10 s is held to 10 s (its ring's byte offsets are ints: 0x20000001 stereo
+       frames overflowed them) */
+    CALL(imp__ZN2nn5audio16CloseInputStreamEPNS0_15InputStreamTypeE, U(stream));
+    CALL(imp__ZN2nn5audio16CloseInputStreamEPNS0_15InputStreamTypeE, U(other));
+    hos_mic_select(0, "", -1);
+    static uint64_t big[0x360 / 8];
+    static const uint32_t stereo[4] = {2, 2, 48000, 0};
+    if (CALL(imp__ZN2nn5audio15OpenInputStreamEPNS0_15InputStreamTypeEPvmRKNS0_15AudioDeviceNameERKNS0_12StreamFormatEi,
+             U(big), U(work), (uint64_t)sizeof work, U(names[0]), U(stereo), (uint64_t)0x20000001) != 0)
+        FAIL(41, "a stream of a huge frame count did not open");
+    START(big);
+    for (int k = 0; k < 12; k++) MS(1000), (void)FILLED(big);   /* (silence comes a second at most a poll) */
+    if (FILLED(big) != 480000) FAIL(42, "a huge frame count: %d frames held, not 10 s", FILLED(big));
+    cases += 2;
     printf("PASS: %d input stream cases (device list, open, start, silence, a shared microphone, capacity, a lost one and its"
            " retries, a quiet one, named ones, a stand-in, stop, close)\n", cases);
     return 0;
@@ -326,6 +347,12 @@ int main() {
     names = {std::string(59, 'x') + "\xc3\xa9" + "yy"};   /* cut at a character's start, not inside the 2-byte one */
     opts.mic = 2, mic_chosen();
     CHECK(mic_want == std::string(59, 'x'));
+    names = {"USB Mic", "Webcam"};   /* a saved name read back (the options file's line, with its end) */
+    for (const char* line : {"USB Mic\n", "USB Mic\r\n", "USB Mic   \n"}) {   /* (the last: as an older build saved it) */
+        mic_want = mic_key(line), opts.mic = 2;
+        refresh_mics();
+        CHECK(mic_want == "USB Mic" && !mic_missing && opts.mic == 2 && !std::strcmp(tx_mic(2), "USB Mic") && told.index == 0);
+    }
     std::puts("PASS: the Microphone row keeps its choice by name, and tells the host");
     return 0;
 }
@@ -367,6 +394,8 @@ def main():
           'the Insert menu has no Microphone row')
     check(re.search(r'hos_mic_count,\s*hos_mic_name,\s*hos_mic_select', (ROOT / 'host' / 'rx_backend.c').read_text(encoding='utf-8')),
           'the menu is not given the microphones')
+    check('mic_want = mic_key(eq + 1);' in (ROOT / 'gpu' / 'vk' / 'vk_menu.cpp').read_text(encoding='utf-8'),
+          'the saved microphone is not read through mic_key')
     check('if (!mic_want.empty()) refresh_mics();' in (ROOT / 'gpu' / 'vk' / 'vk_menu.cpp').read_text(encoding='utf-8'),
           'the start lists the microphones (and starts SDL audio) even with none chosen')
     with tempfile.TemporaryDirectory(prefix='audio-in-') as t:
@@ -375,7 +404,7 @@ def main():
                            ('fixture.c', FIXTURE)):
             (folder / name).write_text(text, encoding='utf-8')
         exe = folder / 'fixture'
-        subprocess.run([a.cc, '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-I', str(folder), str(folder / 'fixture.c'),
+        subprocess.run([a.cc, '-std=gnu11', '-include', ENV_ON_H, '-Wall', '-Wextra', '-Werror', '-I', str(folder), str(folder / 'fixture.c'),
                         '-o', str(exe)], check=True)
         subprocess.run([str(exe)], check=True)
         # (the menu's side: the row's choice by name, gpu/vk/vk_menu.cpp)
@@ -384,7 +413,7 @@ def main():
         fixture = fixture.replace('@REFRESH@', block(menu, 'void mic_tell_host()', 'void save()'))
         (folder / 'menu.cpp').write_text(fixture, encoding='utf-8')
         menu_exe = folder / 'menu'
-        subprocess.run([a.cxx, '-std=c++17', '-Wall', '-Wextra', '-Werror', str(folder / 'menu.cpp'), '-o', str(menu_exe)],
+        subprocess.run([a.cxx, '-std=c++17', '-include', ENV_ON_H, '-Wall', '-Wextra', '-Werror', str(folder / 'menu.cpp'), '-o', str(menu_exe)],
                        check=True)
         subprocess.run([str(menu_exe)], check=True)
 

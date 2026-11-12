@@ -24,6 +24,7 @@ import datetime
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -38,8 +39,10 @@ Program = collections.namedtuple("Program", "name display folders processes alia
 # home folder); the saves are then found under it by LAYOUTS. processes: lower case, without .exe, for the
 # running-game check. The sources are in docs/saves.md.
 EDEN = {"linux": ["{data}/eden"], "windows": ["{appdata}/eden"]}
+# (Lichii has a data folder of its own since its build 150, 2026-11-10; a build from before keeps its saves in Eden's)
+LICHII = {"linux": ["{data}/lichii"] + EDEN["linux"], "windows": ["{appdata}/lichii"] + EDEN["windows"]}
 EMULATORS = [
-    Program("lichii", "Lichii", EDEN, ["lichii"], []),
+    Program("lichii", "Lichii", LICHII, ["lichii"], []),
     Program("frizti", "Frizti (Fritchii)", EDEN, ["lichii", "fritchii"], ["fritchii"]),
     Program("orchid", "Orchid", EDEN, ["orchid"], []),
     Program("pokedinner", "PokeDinner", EDEN, ["eglantine"], []),
@@ -255,27 +258,58 @@ def list_all(args):
         show("Hookshot", *locate(HOOKSHOT, args.hookshot, "--hookshot"))
     except Fail as e:
         print("Hookshot: %s" % e)
+    # (by the folder import and export use, the first of a program's with saves, as locate: the programs whose saves are there)
     groups = collections.OrderedDict()
     for program in EMULATORS:
-        groups.setdefault(tuple(folders(program)), []).append(program.display)
-    for tried, displays in groups.items():
+        tried = folders(program)
+        used = next((d for d in tried if os.path.isdir(d) and find_saves(d)), None)
+        groups.setdefault(used or tuple(tried), []).append(program.display)
+    for where, displays in groups.items():
         title = " / ".join(displays) + (" (one shared folder)" if len(displays) > 1 else "")
-        shown = False
-        for d in tried:
-            found = find_saves(d) if os.path.isdir(d) else {}
-            if found:
-                show(title, d, found)
-                shown = True
-        if not shown:
-            print("%s: nothing in %s" % (title, ", ".join(tried) or "(no default folder)"))
+        if isinstance(where, str):
+            show(title, where, find_saves(where))
+        else:
+            print("%s: nothing in %s" % (title, ", ".join(where) or "(no default folder)"))
     if args.folder:
         show("Folder", *locate(FOLDER, args.folder, "--from"))
 
 
+def refuse_links(path):
+    """A save from someone else is only files and folders: a link in it would copy what it points to (any file or folder
+    of this PC) into the save"""
+    def link(p):
+        # (any reparse point on Windows: a junction is not a symbolic link, and os.path.isjunction is only in 3.12 and
+        # newer; copytree walks into a junction as into a folder)
+        try:
+            st = os.lstat(p)
+        except OSError:
+            return False
+        return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & 0x400)
+    if link(path):
+        raise Fail("%s is a link: a save holds only files and folders, so nothing was copied" % path)
+    for root, dirs, files in os.walk(path):
+        for n in dirs + files:
+            if link(os.path.join(root, n)):
+                raise Fail("%s is a link: a save holds only files and folders, so nothing was copied" % os.path.join(root, n))
+
+
 def copy_saves(src, dst, backup, keep_settings, dry_run):
+    target_path = os.path.normcase(os.path.realpath(dst))
+    backup_path = os.path.normcase(os.path.realpath(backup))
+    try:
+        inside_target = os.path.commonpath((target_path, backup_path)) == target_path
+    except ValueError:
+        inside_target = False  # Windows paths can be on different drives.
+    if inside_target:
+        raise Fail("choose a --backup-dir outside the target save folder (%s)" % dst)
     names = slots(src)
     if not names:
         raise Fail("%s has no slot_* folders: nothing to copy" % src)
+    for s in names:
+        refuse_links(os.path.join(src, s))
+    for f in ("account.sav", "option.sav"):
+        if os.path.lexists(os.path.join(src, f)):
+            refuse_links(os.path.join(src, f))
     files = [f for f in ("account.sav", "option.sav") if os.path.isfile(os.path.join(src, f))]
     if keep_settings and "option.sav" in files:
         files.remove("option.sav")
@@ -291,10 +325,10 @@ def copy_saves(src, dst, backup, keep_settings, dry_run):
     shutil.copytree(dst, backup)
     for s in slots(dst):
         shutil.rmtree(os.path.join(dst, s))
-    for s in names:
-        shutil.copytree(os.path.join(src, s), os.path.join(dst, s))
+    for s in names:   # (links were refused above; copied as links, never followed, all the same)
+        shutil.copytree(os.path.join(src, s), os.path.join(dst, s), symlinks=True)
     for f in files:
-        shutil.copy2(os.path.join(src, f), os.path.join(dst, f))
+        shutil.copy2(os.path.join(src, f), os.path.join(dst, f), follow_symlinks=False)
     print("Done. Backup of the old %s in %s" % (dst, backup))
 
 
